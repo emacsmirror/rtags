@@ -22,6 +22,7 @@
 #include <locale.h>
 #include <math.h>
 #include <mutex>
+#include <poll.h>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -256,6 +257,18 @@ void readerLoop()
 {
     char buf[4096];
     while (!sReaderStop.load()) {
+        struct pollfd pfd;
+        pfd.fd       = sPipeRead;
+        pfd.events   = POLLIN;
+        pfd.revents  = 0;
+        const int pr = ::poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (pr == 0)
+            continue;
         const ssize_t n = ::read(sPipeRead, buf, sizeof(buf));
         if (n <= 0) {
             if (n < 0 && (errno == EINTR))
@@ -386,6 +399,20 @@ void disable()
     if (sTickerThread.joinable())
         sTickerThread.join();
 
+    // Restore stdout/stderr before shutting down the reader thread. Its read
+    // side won't return EOF until every write end of the pipe is gone, and
+    // stdout/stderr still reference the write end until they are restored.
+    if (sSavedStdout >= 0) {
+        ::dup2(sSavedStdout, STDOUT_FILENO);
+        ::close(sSavedStdout);
+        sSavedStdout = -1;
+    }
+    if (sSavedStderr >= 0) {
+        ::dup2(sSavedStderr, STDERR_FILENO);
+        ::close(sSavedStderr);
+        sSavedStderr = -1;
+    }
+
     if (sPipeWrite >= 0) {
         ::close(sPipeWrite);
         sPipeWrite = -1;
@@ -400,17 +427,6 @@ void disable()
     }
 
     std::lock_guard<std::mutex> lock(sMutex);
-
-    if (sSavedStdout >= 0) {
-        ::dup2(sSavedStdout, STDOUT_FILENO);
-        ::close(sSavedStdout);
-        sSavedStdout = -1;
-    }
-    if (sSavedStderr >= 0) {
-        ::dup2(sSavedStderr, STDERR_FILENO);
-        ::close(sSavedStderr);
-        sSavedStderr = -1;
-    }
 
     if (sMessagesWin) {
         delwin(sMessagesWin);
@@ -434,7 +450,7 @@ void disable()
         if (sHaveSavedTermios && ttyFd >= 0) {
             ::tcsetattr(ttyFd, TCSANOW, &sSavedTermios);
         }
-        static const char kRestore[] = "\033[?25h\033[0m\r";
+        static const char kRestore[] = "\033[?25h\033[0m\r\n";
         (void)!::write(ttyFd, kRestore, sizeof(kRestore) - 1);
         ::fclose(sTtyFile);
         sTtyFile = nullptr;
@@ -451,7 +467,10 @@ void asyncSafeRestore()
         if (sHaveSavedTermios) {
             ::tcsetattr(fd, TCSANOW, &sSavedTermios);
         }
-        static const char kRestore[] = "\033[?25h\033[0m\r\n";
+        // Leave the alternate screen, reset the charset and attributes, make
+        // sure autowrap and the keypad are back in their default modes and
+        // show the cursor again.
+        static const char kRestore[] = "\033[?1049l\033(B\033[0m\033[?7h\033[?1l\033>\033[?25h\r\n";
         (void)!::write(fd, kRestore, sizeof(kRestore) - 1);
         ::close(fd);
     }
@@ -480,16 +499,17 @@ void update(const std::shared_ptr<Project> &project, int done, int total, const 
     slot->name = project->displayName();
 
     // First real progress event replaces the seeded 100% snapshot so the new
-    // indexing round is visible from 0%. After that, keep the most-completed
-    // snapshot so finished projects stay pinned at 100%.
+    // indexing round is visible from 0%. After that, a backwards move in done
+    // (or a growing total) means a new indexing round started, so reset the
+    // bar to show it is working again instead of staying pinned at 100%.
     if (!slot->active) {
         slot->active = true;
         slot->total  = total;
         slot->done   = done;
-    } else if (total > slot->total) {
+    } else if (done < slot->done || total > slot->total) {
         slot->total = total;
         slot->done  = done;
-    } else if (total == slot->total && done > slot->done) {
+    } else if (done > slot->done) {
         slot->done = done;
     }
 

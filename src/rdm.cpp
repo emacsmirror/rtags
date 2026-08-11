@@ -108,10 +108,18 @@ static std::atomic<bool> sShutdownWatchdogArmed { false };
 
 static void *shutdownWatchdog(void *)
 {
-    struct timespec ts;
-    ts.tv_sec  = 5;
-    ts.tv_nsec = 0;
-    nanosleep(&ts, nullptr);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const long long deadlineNs = static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec + 5000000000LL;
+    while (true) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (static_cast<long long>(now.tv_sec) * 1000000000LL + now.tv_nsec >= deadlineNs)
+            break;
+        struct timespec ts;
+        ts.tv_sec  = 0;
+        ts.tv_nsec = 100000000; // 100ms, retried so EINTR can't abort the watchdog
+        nanosleep(&ts, nullptr);
+    }
     Tui::asyncSafeRestore();
     static const char msg[] = "\nrdm: shutdown watchdog fired, force-exiting\n";
     (void)!::write(STDERR_FILENO, msg, sizeof(msg) - 1);
