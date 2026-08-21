@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <mutex>
+#include <stdlib.h>
 #include <string.h>
 
 #include "Source.h"
@@ -28,6 +29,9 @@
 #include "rct/Set.h"
 #include "rct/String.h"
 
+#define TO_STR1(x) #x
+#define TO_STR(x) TO_STR1(x)
+
 static std::mutex sMutex;
 
 struct Compiler
@@ -35,6 +39,7 @@ struct Compiler
     bool inited { false };
     bool isEmscripten { false };
     bool isClang { false };
+    int clangMajorVersion { 0 };
 
     // There are three include-path-limiting options:
     //   1. -nostdinc      -- disables all default system include paths
@@ -142,6 +147,8 @@ void applyToSource(Source &source, Flags<CompilerManager::Flag> flags)
                 } else if (def.define == "__clang__") {
                     compiler.isClang = true;
                     debug() << "[CompilerManager] Detected Clang compiler:" << cpath;
+                } else if (def.define == "__clang_major__") {
+                    compiler.clangMajorVersion = atoi(def.value.constData());
                 }
             }
         }
@@ -235,6 +242,32 @@ void applyToSource(Source &source, Flags<CompilerManager::Flag> flags)
         source.arguments.push_back("--target=wasm32-unknown-emscripten");
         debug() << "[CompilerManager] Added --target=wasm32-unknown-emscripten for Emscripten source";
     }
+
+#ifdef CLANG_VERSION
+    {
+        // When the libclang used for indexing is newer than the project's
+        // compiler, it may produce diagnostics (including fixits) for
+        // warnings that the compiler wouldn't emit — e.g. an expanded
+        // -Wunsafe-buffer-usage in clang 22 vs 18. Suppress these so the
+        // user only sees warnings their compiler would actually produce.
+        // -Wno-unknown-warning-option (added by default) makes it safe to
+        // pass these even if the libclang doesn't recognize them yet.
+        static const int libclangMajor = atoi(TO_STR(CLANG_VERSION));
+        if (libclangMajor > compiler.clangMajorVersion) {
+            static const char *const warnings[] = {
+                "-Wno-unsafe-buffer-usage",
+            };
+            for (const char *w : warnings) {
+                const String positive = String("-W") + (w + 5); // "-Wno-X" -> "-WX"
+                if (!source.arguments.contains(positive))
+                    source.arguments.push_back(w);
+            }
+            debug() << "[CompilerManager] Suppressed newer-clang warnings"
+                    << "(libclang" << libclangMajor
+                    << "vs compiler" << compiler.clangMajorVersion << ")";
+        }
+    }
+#endif
 }
 
 } // namespace CompilerManager
